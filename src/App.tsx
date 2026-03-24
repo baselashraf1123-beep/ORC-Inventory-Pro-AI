@@ -35,17 +35,18 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
+import { Preferences } from '@capacitor/preferences';
 import { OCRService } from './services/ocrService';
 import { InventoryItem, OCRTask } from './types';
 
 const ocrService = new OCRService();
 
+const STORAGE_KEY = 'orc_inventory_pro_data';
+
 export default function App() {
   const [view, setView] = useState<'home' | 'batch' | 'list' | 'settings' | 'manual'>('home');
-  const [items, setItems] = useState<InventoryItem[]>(() => {
-    const saved = localStorage.getItem('orc_inventory_pro_data');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [items, setItems] = useState<InventoryItem[]>([]);
+  const [isDataLoaded, setIsDataLoaded] = useState(false);
   const [history, setHistory] = useState<InventoryItem[][]>([]);
   const [redoStack, setRedoStack] = useState<InventoryItem[][]>([]);
   const [tasks, setTasks] = useState<OCRTask[]>([]);
@@ -82,15 +83,37 @@ export default function App() {
     notes: ''
   });
 
-  // Save data
+  // Load data and handle migration
   useEffect(() => {
-    try {
-      localStorage.setItem('orc_inventory_pro_data', JSON.stringify(items));
-    } catch (error) {
-      console.error('Storage quota exceeded', error);
-      showToast('مساحة التخزين ممتلئة! يرجى تصدير البيانات ومسح السجلات القديمة.', 'error');
+    const loadData = async () => {
+      // 1. Check Preferences first
+      const { value } = await Preferences.get({ key: STORAGE_KEY });
+      
+      if (value) {
+        setItems(JSON.parse(value));
+      } else {
+        // 2. Fallback to localStorage for migration
+        const legacyData = localStorage.getItem(STORAGE_KEY);
+        if (legacyData) {
+          const parsed = JSON.parse(legacyData);
+          setItems(parsed);
+          // Save to Preferences immediately
+          await Preferences.set({ key: STORAGE_KEY, value: legacyData });
+          // Optional: clear localStorage after successful migration
+          // localStorage.removeItem(STORAGE_KEY);
+        }
+      }
+      setIsDataLoaded(true);
+    };
+    loadData();
+  }, []);
+
+  // Save data to Preferences
+  useEffect(() => {
+    if (isDataLoaded) {
+      Preferences.set({ key: STORAGE_KEY, value: JSON.stringify(items) });
     }
-  }, [items]);
+  }, [items, isDataLoaded]);
 
   // Security & IP Protection Measures
   useEffect(() => {
@@ -323,17 +346,27 @@ export default function App() {
   };
 
   const saveManualItem = () => {
-    if (!manualItem.code || !manualItem.quantity || manualItem.quantity <= 0) {
-      showToast('يرجى إدخال كود الصنف وكمية صحيحة أكبر من صفر', 'error');
+    // Robust Validation
+    const code = manualItem.code?.trim();
+    const quantity = manualItem.quantity;
+    
+    if (!code || code.length < 2) {
+      showToast('كود الصنف يجب أن يكون حرفين على الأقل', 'error');
       return;
     }
+    
+    if (quantity === undefined || isNaN(quantity) || quantity <= 0) {
+      showToast('يرجى إدخال كمية صحيحة أكبر من صفر', 'error');
+      return;
+    }
+
     const newItem: InventoryItem = {
       id: Math.random().toString(36).substr(2, 9),
-      code: manualItem.code!,
-      colorNo: manualItem.colorNo || '',
-      quantity: manualItem.quantity!,
+      code: code.toUpperCase(),
+      colorNo: (manualItem.colorNo || '').trim().toUpperCase(),
+      quantity: quantity,
       unit: manualItem.unit || 'M',
-      notes: manualItem.notes || '',
+      notes: (manualItem.notes || '').trim(),
       sessionId: 'Manual_Entry',
       createdAt: new Date().toISOString(),
       isExported: false
@@ -490,22 +523,31 @@ export default function App() {
         const file = new File([blob], fileName, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
         
         if (navigator.canShare && navigator.canShare({ files: [file] })) {
-          await navigator.share({
-            files: [file],
-            title: 'تقرير المخزون',
-            text: 'مرفق تقرير المخزون بصيغة Excel'
-          });
+          try {
+            await navigator.share({
+              files: [file],
+              title: 'تقرير المخزون',
+              text: 'مرفق تقرير المخزون بصيغة Excel'
+            });
+          } catch (shareError: any) {
+            if (shareError.name === 'AbortError') {
+              console.log('User cancelled sharing');
+              return; 
+            }
+            throw new Error(`فشلت عملية المشاركة: ${shareError.message || 'خطأ غير متوقع أثناء المشاركة'}`);
+          }
         } else {
           // Fallback to standard download
-          XLSX.writeFile(workbook, fileName);
+          try {
+            XLSX.writeFile(workbook, fileName);
+          } catch (writeError: any) {
+            throw new Error(`فشل إنشاء ملف Excel وتحميله: ${writeError.message || 'تأكد من صلاحيات المتصفح'}`);
+          }
         }
-      } catch (shareError: any) {
-        if (shareError.name === 'AbortError') {
-          console.log('User cancelled sharing');
-          return; // Don't download or mark as exported if user cancelled
-        }
-        console.log('Sharing failed or cancelled, falling back to download', shareError);
-        XLSX.writeFile(workbook, fileName);
+      } catch (err: any) {
+        console.error('Export error:', err);
+        showToast(err.message || 'حدث خطأ تقني أثناء تصدير البيانات', 'error');
+        return;
       }
 
       // Mark as exported
@@ -756,29 +798,38 @@ export default function App() {
                       <img src={task.image} alt="Label" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                     </div>
                     <div 
-                      className="flex-1 min-w-0 cursor-pointer"
+                      className="flex-1 min-w-0 cursor-pointer relative"
                       onClick={() => {
                         if (task.status === 'pending' || task.status === 'processing') return;
                         setEditingTask(task);
                       }}
                     >
                       {task.status === 'processing' ? (
-                        <div className="flex items-center gap-2 text-indigo-600 text-sm font-bold">
-                          <Loader2 className="w-4 h-4 animate-spin" /> جاري التحليل...
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2 text-indigo-600 text-sm font-bold">
+                            <Loader2 className="w-4 h-4 animate-spin" /> جاري التحليل...
+                          </div>
+                          <div className="h-1 bg-indigo-100 rounded-full overflow-hidden">
+                            <motion.div 
+                              className="h-full bg-indigo-600"
+                              animate={{ x: ["-100%", "100%"] }}
+                              transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}
+                            />
+                          </div>
                         </div>
                       ) : task.status === 'pending' ? (
-                        <div className="text-sm font-bold text-stone-500">في الانتظار...</div>
+                        <div className="text-sm font-bold text-stone-400 italic">في الانتظار...</div>
                       ) : (
                         <>
-                          <div className="font-bold text-stone-800 truncate">
+                          <div className={`font-bold truncate ${task.status === 'failed' ? 'text-red-600' : 'text-stone-800'}`}>
                             {task.result?.itemNo || (task.status === 'failed' ? 'فشلت المعالجة' : 'بيانات مفقودة - انقر للتصحيح')}
                           </div>
                           {task.error ? (
-                            <div className="text-[10px] text-red-500 font-bold mt-1">{task.error}</div>
+                            <div className="text-[10px] text-red-400 font-medium mt-1 leading-tight">{task.error}</div>
                           ) : (
                             <div className="text-xs text-stone-500 flex gap-3 mt-1">
-                              <span className="bg-stone-50 px-2 py-0.5 rounded-md">اللون: {task.result?.colorNo || '-'}</span>
-                              <span className="bg-stone-50 px-2 py-0.5 rounded-md">الكمية: {task.result?.length || '-'}{task.result?.unit || 'M'}</span>
+                              <span className="bg-stone-50 px-2 py-0.5 rounded-md border border-stone-100/50">اللون: {task.result?.colorNo || '-'}</span>
+                              <span className="bg-stone-50 px-2 py-0.5 rounded-md border border-stone-100/50">الكمية: {task.result?.length || '-'}{task.result?.unit || 'M'}</span>
                             </div>
                           )}
                         </>
@@ -950,34 +1001,64 @@ export default function App() {
               <div className="bg-white p-6 rounded-[2.5rem] border border-stone-100 shadow-xl shadow-stone-100/50 space-y-5">
                 <div className="space-y-1.5">
                   <label className="text-[10px] font-black text-stone-400 uppercase mr-1">كود الصنف (ITEM NO)</label>
-                  <input 
-                    type="text"
-                    placeholder="مثال: ART 1234"
-                    value={manualItem.code}
-                    onChange={(e) => setManualItem({...manualItem, code: e.target.value})}
-                    className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                  />
+                  <div className="relative">
+                    <input 
+                      type="text"
+                      placeholder="مثال: ART 1234"
+                      value={manualItem.code}
+                      onChange={(e) => setManualItem({...manualItem, code: e.target.value})}
+                      className={`w-full bg-stone-50 border ${manualItem.code.length < 2 ? 'border-red-200 focus:ring-red-500/10' : 'border-stone-100 focus:ring-indigo-500/10'} rounded-2xl px-5 py-4 outline-none font-bold transition-all`}
+                    />
+                    {manualItem.code && (
+                      <button 
+                        onClick={() => setManualItem({...manualItem, code: ''})}
+                        className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                      >
+                        <X size={16} />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="space-y-1.5">
                   <label className="text-[10px] font-black text-stone-400 uppercase mr-1">رقم اللون (COLOR NO)</label>
-                  <input 
-                    type="text"
-                    placeholder="مثال: COL 55"
-                    value={manualItem.colorNo}
-                    onChange={(e) => setManualItem({...manualItem, colorNo: e.target.value})}
-                    className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                  />
+                  <div className="relative">
+                    <input 
+                      type="text"
+                      placeholder="مثال: COL 55"
+                      value={manualItem.colorNo}
+                      onChange={(e) => setManualItem({...manualItem, colorNo: e.target.value})}
+                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
+                    />
+                    {manualItem.colorNo && (
+                      <button 
+                        onClick={() => setManualItem({...manualItem, colorNo: ''})}
+                        className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                      >
+                        <X size={16} />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-stone-400 uppercase mr-1">الكمية</label>
-                    <input 
-                      type="number"
-                      placeholder="0.00"
-                      value={manualItem.quantity || ''}
-                      onChange={(e) => setManualItem({...manualItem, quantity: parseFloat(e.target.value)})}
-                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                    />
+                    <div className="relative">
+                      <input 
+                        type="number"
+                        placeholder="0.00"
+                        value={manualItem.quantity || ''}
+                        onChange={(e) => setManualItem({...manualItem, quantity: parseFloat(e.target.value)})}
+                        className={`w-full bg-stone-50 border ${manualItem.quantity <= 0 ? 'border-red-200 focus:ring-red-500/10' : 'border-stone-100 focus:ring-indigo-500/10'} rounded-2xl px-5 py-4 outline-none font-bold transition-all`}
+                      />
+                      {manualItem.quantity > 0 && (
+                        <button 
+                          onClick={() => setManualItem({...manualItem, quantity: 0})}
+                          className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                        >
+                          <X size={16} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-stone-400 uppercase mr-1">الوحدة</label>
@@ -994,12 +1075,22 @@ export default function App() {
                 </div>
                 <div className="space-y-1.5">
                   <label className="text-[10px] font-black text-stone-400 uppercase mr-1">ملاحظات</label>
-                  <textarea 
-                    placeholder="أضف ملاحظات إضافية هنا..."
-                    value={manualItem.notes}
-                    onChange={(e) => setManualItem({...manualItem, notes: e.target.value})}
-                    className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all h-24 resize-none"
-                  />
+                  <div className="relative">
+                    <textarea 
+                      placeholder="أضف ملاحظات إضافية هنا..."
+                      value={manualItem.notes}
+                      onChange={(e) => setManualItem({...manualItem, notes: e.target.value})}
+                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all h-24 resize-none"
+                    />
+                    {manualItem.notes && (
+                      <button 
+                        onClick={() => setManualItem({...manualItem, notes: ''})}
+                        className="absolute left-4 top-4 text-stone-300 hover:text-stone-500 p-1"
+                      >
+                        <X size={16} />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="flex gap-3 pt-2">
                   <button 
@@ -1076,9 +1167,10 @@ export default function App() {
                       title: 'مسح البيانات',
                       message: 'سيتم حذف كافة البيانات نهائياً، هل أنت متأكد؟',
                       type: 'danger',
-                      onConfirm: () => {
+                      onConfirm: async () => {
                         updateItemsWithHistory([]);
-                        localStorage.removeItem('orc_inventory_pro_data');
+                        await Preferences.remove({ key: STORAGE_KEY });
+                        localStorage.removeItem(STORAGE_KEY);
                         setConfirmModal(prev => ({ ...prev, show: false }));
                       }
                     });
@@ -1144,43 +1236,82 @@ export default function App() {
               <div className="space-y-4">
                 <div className="space-y-1.5">
                   <label className="text-[10px] font-black text-stone-400 uppercase mr-1">ITEM NO</label>
-                  <input 
-                    type="text" 
-                    placeholder="أدخل كود الصنف"
-                    value={editingTask.result?.itemNo || ''} 
-                    onChange={(e) => {
-                      const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), itemNo: e.target.value } };
-                      setEditingTask(updated);
-                    }}
-                    className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                  />
+                  <div className="relative">
+                    <input 
+                      type="text" 
+                      placeholder="أدخل كود الصنف"
+                      value={editingTask.result?.itemNo || ''} 
+                      onChange={(e) => {
+                        const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), itemNo: e.target.value } };
+                        setEditingTask(updated);
+                      }}
+                      className={`w-full bg-stone-50 border ${(editingTask.result?.itemNo || '').length < 2 ? 'border-red-200 focus:ring-red-500/10' : 'border-stone-100 focus:ring-indigo-500/10'} rounded-2xl px-5 py-4 outline-none font-bold transition-all`}
+                    />
+                    {editingTask.result?.itemNo && (
+                      <button 
+                        onClick={() => {
+                          const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), itemNo: '' } };
+                          setEditingTask(updated);
+                        }}
+                        className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                      >
+                        <X size={16} />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-stone-400 uppercase mr-1">COLOR NO</label>
-                    <input 
-                      type="text" 
-                      placeholder="اللون"
-                      value={editingTask.result?.colorNo || ''} 
-                      onChange={(e) => {
-                        const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), colorNo: e.target.value } };
-                        setEditingTask(updated);
-                      }}
-                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                    />
+                    <div className="relative">
+                      <input 
+                        type="text" 
+                        placeholder="اللون"
+                        value={editingTask.result?.colorNo || ''} 
+                        onChange={(e) => {
+                          const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), colorNo: e.target.value } };
+                          setEditingTask(updated);
+                        }}
+                        className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
+                      />
+                      {editingTask.result?.colorNo && (
+                        <button 
+                          onClick={() => {
+                            const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), colorNo: '' } };
+                            setEditingTask(updated);
+                          }}
+                          className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                        >
+                          <X size={16} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-stone-400 uppercase mr-1">LENGTH</label>
-                    <input 
-                      type="text" 
-                      placeholder="الطول"
-                      value={editingTask.result?.length || ''} 
-                      onChange={(e) => {
-                        const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), length: e.target.value } };
-                        setEditingTask(updated);
-                      }}
-                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                    />
+                    <div className="relative">
+                      <input 
+                        type="text" 
+                        placeholder="الطول"
+                        value={editingTask.result?.length || ''} 
+                        onChange={(e) => {
+                          const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), length: e.target.value } };
+                          setEditingTask(updated);
+                        }}
+                        className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
+                      />
+                      {editingTask.result?.length && (
+                        <button 
+                          onClick={() => {
+                            const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), length: '' } };
+                            setEditingTask(updated);
+                          }}
+                          className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                        >
+                          <X size={16} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
@@ -1202,30 +1333,56 @@ export default function App() {
                   </div>
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-stone-400 uppercase mr-1">ملاحظات</label>
-                    <input 
-                      type="text" 
-                      placeholder="ملاحظات..."
-                      value={editingTask.result?.notes || ''}
-                      onChange={(e) => {
-                        const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), notes: e.target.value } };
-                        setEditingTask(updated);
-                      }}
-                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                    />
+                    <div className="relative">
+                      <input 
+                        type="text" 
+                        placeholder="ملاحظات..."
+                        value={editingTask.result?.notes || ''}
+                        onChange={(e) => {
+                          const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), notes: e.target.value } };
+                          setEditingTask(updated);
+                        }}
+                        className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
+                      />
+                      {editingTask.result?.notes && (
+                        <button 
+                          onClick={() => {
+                            const updated = { ...editingTask, result: { ...(editingTask.result || { itemNo: '', colorNo: '', length: '', unit: 'M', notes: '' }), notes: '' } };
+                            setEditingTask(updated);
+                          }}
+                          className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                        >
+                          <X size={16} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
 
               <button 
                 onClick={() => {
-                  const qty = parseFloat(editingTask.result?.length || '0');
-                  if (!editingTask.result?.itemNo || qty <= 0) {
-                    showToast('يرجى إدخال كود الصنف وكمية صحيحة أكبر من صفر', 'error');
+                  const code = editingTask.result?.itemNo?.trim();
+                  const quantity = parseFloat(editingTask.result?.length || '0');
+
+                  if (!code || code.length < 2) {
+                    showToast('كود الصنف يجب أن يكون حرفين على الأقل', 'error');
                     return;
                   }
-                  const updatedTasks = tasks.map(t => t.id === editingTask.id ? { ...editingTask, status: 'success' as const } : t);
+                  if (isNaN(quantity) || quantity <= 0) {
+                    showToast('الكمية يجب أن تكون رقماً أكبر من صفر', 'error');
+                    return;
+                  }
+
+                  const updatedTasks = tasks.map(t => t.id === editingTask.id ? { 
+                    ...editingTask, 
+                    result: { ...editingTask.result!, itemNo: code.toUpperCase(), length: String(quantity) },
+                    status: 'success' as const,
+                    error: undefined 
+                  } : t);
                   setTasks(updatedTasks);
                   setEditingTask(null);
+                  showToast('تم اعتماد البيانات بنجاح', 'success');
                 }}
                 className="w-full bg-indigo-600 text-white font-bold py-5 rounded-[1.5rem] shadow-2xl shadow-indigo-200 flex items-center justify-center gap-3 active:scale-95 transition-all"
               >
@@ -1252,34 +1409,64 @@ export default function App() {
               <div className="space-y-4">
                 <div className="space-y-1.5">
                   <label className="text-[10px] font-black text-stone-400 uppercase mr-1">ITEM NO</label>
-                  <input 
-                    type="text" 
-                    placeholder="أدخل كود الصنف"
-                    value={editingSavedItem.code} 
-                    onChange={(e) => setEditingSavedItem({ ...editingSavedItem, code: e.target.value })}
-                    className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                  />
+                  <div className="relative">
+                    <input 
+                      type="text" 
+                      placeholder="أدخل كود الصنف"
+                      value={editingSavedItem.code} 
+                      onChange={(e) => setEditingSavedItem({ ...editingSavedItem, code: e.target.value })}
+                      className={`w-full bg-stone-50 border ${editingSavedItem.code.length < 2 ? 'border-red-200 focus:ring-red-500/10' : 'border-stone-100 focus:ring-indigo-500/10'} rounded-2xl px-5 py-4 outline-none font-bold transition-all`}
+                    />
+                    {editingSavedItem.code && (
+                      <button 
+                        onClick={() => setEditingSavedItem({ ...editingSavedItem, code: '' })}
+                        className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                      >
+                        <X size={16} />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-stone-400 uppercase mr-1">COLOR NO</label>
-                    <input 
-                      type="text" 
-                      placeholder="اللون"
-                      value={editingSavedItem.colorNo} 
-                      onChange={(e) => setEditingSavedItem({ ...editingSavedItem, colorNo: e.target.value })}
-                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                    />
+                    <div className="relative">
+                      <input 
+                        type="text" 
+                        placeholder="اللون"
+                        value={editingSavedItem.colorNo} 
+                        onChange={(e) => setEditingSavedItem({ ...editingSavedItem, colorNo: e.target.value })}
+                        className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
+                      />
+                      {editingSavedItem.colorNo && (
+                        <button 
+                          onClick={() => setEditingSavedItem({ ...editingSavedItem, colorNo: '' })}
+                          className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                        >
+                          <X size={16} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-stone-400 uppercase mr-1">LENGTH</label>
-                    <input 
-                      type="number" 
-                      placeholder="الطول"
-                      value={editingSavedItem.quantity || ''} 
-                      onChange={(e) => setEditingSavedItem({ ...editingSavedItem, quantity: parseFloat(e.target.value) || 0 })}
-                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                    />
+                    <div className="relative">
+                      <input 
+                        type="number" 
+                        placeholder="الطول"
+                        value={editingSavedItem.quantity || ''} 
+                        onChange={(e) => setEditingSavedItem({ ...editingSavedItem, quantity: parseFloat(e.target.value) || 0 })}
+                        className={`w-full bg-stone-50 border ${editingSavedItem.quantity <= 0 ? 'border-red-200 focus:ring-red-500/10' : 'border-stone-100 focus:ring-indigo-500/10'} rounded-2xl px-5 py-4 outline-none font-bold transition-all`}
+                      />
+                      {editingSavedItem.quantity > 0 && (
+                        <button 
+                          onClick={() => setEditingSavedItem({ ...editingSavedItem, quantity: 0 })}
+                          className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                        >
+                          <X size={16} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
@@ -1298,27 +1485,50 @@ export default function App() {
                   </div>
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-stone-400 uppercase mr-1">ملاحظات</label>
-                    <input 
-                      type="text" 
-                      placeholder="ملاحظات..."
-                      value={editingSavedItem.notes || ''}
-                      onChange={(e) => setEditingSavedItem({ ...editingSavedItem, notes: e.target.value })}
-                      className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
-                    />
+                    <div className="relative">
+                      <input 
+                        type="text" 
+                        placeholder="ملاحظات..."
+                        value={editingSavedItem.notes || ''}
+                        onChange={(e) => setEditingSavedItem({ ...editingSavedItem, notes: e.target.value })}
+                        className="w-full bg-stone-50 border border-stone-100 rounded-2xl px-5 py-4 focus:ring-4 ring-indigo-500/10 outline-none font-bold transition-all"
+                      />
+                      {editingSavedItem.notes && (
+                        <button 
+                          onClick={() => setEditingSavedItem({ ...editingSavedItem, notes: '' })}
+                          className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-300 hover:text-stone-500 p-1"
+                        >
+                          <X size={16} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
 
               <button 
                 onClick={() => {
-                  if (!editingSavedItem.code || !editingSavedItem.quantity || editingSavedItem.quantity <= 0) {
-                    showToast('يرجى إدخال كود الصنف وكمية صحيحة أكبر من صفر', 'error');
+                  const code = editingSavedItem.code?.trim();
+                  const quantity = parseFloat(String(editingSavedItem.quantity));
+
+                  if (!code || code.length < 2) {
+                    showToast('كود الصنف يجب أن يكون حرفين على الأقل', 'error');
                     return;
                   }
-                  const updatedItems = items.map(i => i.id === editingSavedItem.id ? editingSavedItem : i);
+                  if (isNaN(quantity) || quantity <= 0) {
+                    showToast('الكمية يجب أن تكون رقماً أكبر من صفر', 'error');
+                    return;
+                  }
+
+                  const updatedItems = items.map(i => i.id === editingSavedItem.id ? {
+                    ...editingSavedItem,
+                    code: code.toUpperCase(),
+                    colorNo: (editingSavedItem.colorNo || '').trim().toUpperCase(),
+                    quantity: quantity
+                  } : i);
                   updateItemsWithHistory(updatedItems);
                   setEditingSavedItem(null);
-                  showToast('تم تعديل الصنف بنجاح');
+                  showToast('تم تعديل الصنف بنجاح', 'success');
                 }}
                 className="w-full bg-indigo-600 text-white font-bold py-5 rounded-[1.5rem] shadow-2xl shadow-indigo-200 flex items-center justify-center gap-3 active:scale-95 transition-all"
               >
