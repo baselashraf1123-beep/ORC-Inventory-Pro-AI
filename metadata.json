@@ -1,0 +1,7 @@
+{
+  "name": "ORC Inventory Pro AI",
+  "description": "Professional Inventory Scanner with AI Batch OCR and Smart Excel Export.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
