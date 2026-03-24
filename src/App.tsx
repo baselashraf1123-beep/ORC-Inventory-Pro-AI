@@ -7,6 +7,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { 
   Camera, 
   History, 
+  Search,
   Settings, 
   ChevronLeft, 
   Scan, 
@@ -36,6 +37,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
 import { Preferences } from '@capacitor/preferences';
+import { compressImage } from './lib/imageUtils';
 import { OCRService } from './services/ocrService';
 import { InventoryItem, OCRTask } from './types';
 
@@ -108,11 +110,15 @@ export default function App() {
     loadData();
   }, []);
 
-  // Save data to Preferences
+  // Save data to Preferences with Debounce to prevent UI lag on large lists
   useEffect(() => {
-    if (isDataLoaded) {
+    if (!isDataLoaded) return;
+    
+    const timer = setTimeout(() => {
       Preferences.set({ key: STORAGE_KEY, value: JSON.stringify(items) });
-    }
+    }, 1000); // Wait 1 second after last change before saving
+
+    return () => clearTimeout(timer);
   }, [items, isDataLoaded]);
 
   // Security & IP Protection Measures
@@ -301,7 +307,9 @@ export default function App() {
       setTasks([...currentTasks]);
 
       try {
-        const result = await ocrService.processImage(currentTasks[i].image);
+        // ضغط الصورة قبل الإرسال لتحسين الأداء وسرعة الرفع
+        const compressed = await compressImage(currentTasks[i].image);
+        const result = await ocrService.processImage(compressed);
         
         currentTasks[i].result = {
           itemNo: result.itemNo,
@@ -311,6 +319,12 @@ export default function App() {
           notes: result.notes
         };
         currentTasks[i].status = (result.itemNo && result.length) ? 'success' : 'failed';
+        
+        // Memory Optimization: Clear raw image data after successful processing
+        if (currentTasks[i].status === 'success') {
+          currentTasks[i].image = ''; // Keep memory low on mobile
+        }
+
         if (currentTasks[i].status === 'failed') {
           currentTasks[i].error = "لم يتم العثور على بيانات واضحة في الصورة";
         }
@@ -367,7 +381,7 @@ export default function App() {
       quantity: quantity,
       unit: manualItem.unit || 'M',
       notes: (manualItem.notes || '').trim(),
-      sessionId: 'Manual_Entry',
+      sessionId: `MANUAL_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
       createdAt: new Date().toISOString(),
       isExported: false
     };
@@ -399,12 +413,36 @@ export default function App() {
     setView('home');
   };
 
+  const stats = useMemo(() => {
+    const totalMeters = items.reduce((acc, i) => i.unit === 'M' ? acc + i.quantity : acc, 0);
+    const totalYards = items.reduce((acc, i) => i.unit === 'Yard' ? acc + i.quantity : acc, 0);
+    const newItems = items.filter(i => !i.isExported).length;
+    const exportedItems = items.filter(i => i.isExported).length;
+    return { totalMeters, totalYards, newItems, exportedItems, totalCount: items.length };
+  }, [items]);
+
   const filteredItems = useMemo(() => {
     return items.filter(item => 
       item.code.toLowerCase().includes(searchQuery.toLowerCase()) ||
       item.colorNo.toLowerCase().includes(searchQuery.toLowerCase())
     );
   }, [items, searchQuery]);
+
+  const clearAllData = () => {
+    if (items.length === 0) return;
+    
+    setConfirmModal({
+      show: true,
+      title: 'حذف جميع البيانات',
+      message: 'هل أنت متأكد تماماً من حذف جميع السجلات؟ لا يمكن التراجع عن هذه العملية.',
+      type: 'error',
+      onConfirm: () => {
+        updateItemsWithHistory([]);
+        showToast('تم مسح جميع البيانات بنجاح', 'success');
+        setConfirmModal(prev => ({ ...prev, show: false }));
+      }
+    });
+  };
 
   const saveBatch = () => {
     if (isProcessing) return;
@@ -432,16 +470,16 @@ export default function App() {
       type: 'success',
       onConfirm: () => {
         setIsProcessing(true);
-        const sessionId = `Session_${new Date().getTime()}`;
+        const sessionId = `BATCH_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
         setLastSessionId(sessionId);
         
         const newItems: InventoryItem[] = validTasks.map(t => ({
           id: Math.random().toString(36).substr(2, 9),
-          code: t.result!.itemNo,
-          colorNo: t.result!.colorNo,
-          quantity: parseFloat(t.result!.length) || 0,
-          unit: t.result!.unit || 'M',
-          notes: t.result!.notes || '',
+          code: (t.result?.itemNo || '').trim().toUpperCase(),
+          colorNo: (t.result?.colorNo || '').trim().toUpperCase(),
+          quantity: parseFloat(t.result?.length || '0') || 0,
+          unit: (t.result?.unit || 'M') as 'M' | 'Yard' | 'Roll' | 'Piece',
+          notes: (t.result?.notes || '').trim(),
           sessionId,
           createdAt: new Date().toISOString(),
           isExported: false
@@ -522,6 +560,7 @@ export default function App() {
         const blob = new Blob([excelBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
         const file = new File([blob], fileName, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
         
+        let shared = false;
         if (navigator.canShare && navigator.canShare({ files: [file] })) {
           try {
             await navigator.share({
@@ -529,14 +568,18 @@ export default function App() {
               title: 'تقرير المخزون',
               text: 'مرفق تقرير المخزون بصيغة Excel'
             });
+            shared = true;
           } catch (shareError: any) {
             if (shareError.name === 'AbortError') {
               console.log('User cancelled sharing');
               return; 
             }
-            throw new Error(`فشلت عملية المشاركة: ${shareError.message || 'خطأ غير متوقع أثناء المشاركة'}`);
+            console.warn('Native share failed, falling back to download:', shareError);
+            // Don't throw here, let it fall back to XLSX.writeFile
           }
-        } else {
+        }
+
+        if (!shared) {
           // Fallback to standard download
           try {
             XLSX.writeFile(workbook, fileName);
@@ -635,24 +678,43 @@ export default function App() {
               exit={{ opacity: 0, y: -10 }}
               className="p-6 space-y-6"
             >
-              {/* Stats Card */}
-              <div className="bg-indigo-600 rounded-[2rem] p-8 text-white shadow-2xl shadow-indigo-200 relative overflow-hidden">
-                <div className="relative z-10">
-                  <p className="text-indigo-100 text-xs font-bold uppercase tracking-widest mb-1">إجمالي المسح</p>
-                  <h2 className="text-4xl font-black mb-4">{items.length} <span className="text-lg font-normal opacity-70">صنف</span></h2>
-                  <div className="flex gap-4">
-                    <div className="bg-white/10 backdrop-blur-md px-4 py-2 rounded-2xl border border-white/10">
-                      <p className="text-[10px] opacity-70">جديد</p>
-                      <p className="font-bold">{items.filter(i => !i.isExported).length}</p>
+              {/* Stats Card - Enhanced Dashboard */}
+              <div className="bg-indigo-600 rounded-[3rem] p-8 text-white shadow-2xl shadow-indigo-200 relative overflow-hidden">
+                <div className="relative z-10 space-y-6">
+                  <div className="flex justify-between items-start">
+                    <div>
+                      <p className="text-indigo-100 text-[10px] font-black uppercase tracking-[0.2em] mb-1">إجمالي المخزون</p>
+                      <h2 className="text-5xl font-black">{items.length} <span className="text-sm font-normal opacity-60">صنف</span></h2>
                     </div>
-                    <div className="bg-white/10 backdrop-blur-md px-4 py-2 rounded-2xl border border-white/10">
-                      <p className="text-[10px] opacity-70">تم تصديره</p>
-                      <p className="font-bold">{items.filter(i => i.isExported).length}</p>
+                    <div className="bg-white/10 backdrop-blur-xl p-3 rounded-2xl border border-white/10">
+                      <LayoutGrid size={24} className="text-indigo-200" />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-white/5 backdrop-blur-md p-4 rounded-[1.5rem] border border-white/5">
+                      <p className="text-[9px] font-bold text-indigo-200 uppercase mb-1">إجمالي الأمتار</p>
+                      <p className="text-xl font-black">{stats.totalMeters.toFixed(1)} <span className="text-[10px] font-normal opacity-60">M</span></p>
+                    </div>
+                    <div className="bg-white/5 backdrop-blur-md p-4 rounded-[1.5rem] border border-white/5">
+                      <p className="text-[9px] font-bold text-indigo-200 uppercase mb-1">إجمالي الياردات</p>
+                      <p className="text-xl font-black">{stats.totalYards.toFixed(1)} <span className="text-[10px] font-normal opacity-60">Y</span></p>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-3">
+                    <div className="flex-1 bg-emerald-500/20 backdrop-blur-md px-4 py-3 rounded-2xl border border-emerald-500/20 flex items-center justify-between">
+                      <span className="text-[10px] font-bold text-emerald-200">جديد</span>
+                      <span className="font-black text-emerald-400">{stats.newItems}</span>
+                    </div>
+                    <div className="flex-1 bg-white/5 backdrop-blur-md px-4 py-3 rounded-2xl border border-white/5 flex items-center justify-between">
+                      <span className="text-[10px] font-bold text-indigo-200">مصدّر</span>
+                      <span className="font-black text-white">{stats.exportedItems}</span>
                     </div>
                   </div>
                 </div>
-                <div className="absolute -right-10 -bottom-10 opacity-10 rotate-12">
-                  <LayoutGrid size={220} />
+                <div className="absolute -right-20 -bottom-20 opacity-5 rotate-12">
+                  <LayoutGrid size={300} />
                 </div>
               </div>
 
@@ -824,6 +886,24 @@ export default function App() {
                           <div className={`font-bold truncate ${task.status === 'failed' ? 'text-red-600' : 'text-stone-800'}`}>
                             {task.result?.itemNo || (task.status === 'failed' ? 'فشلت المعالجة' : 'بيانات مفقودة - انقر للتصحيح')}
                           </div>
+                          {task.status === 'success' && task.result && (
+                            <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1">
+                              <div className="flex items-center gap-1">
+                                <span className="text-[10px] font-black text-stone-400 uppercase">Color:</span>
+                                <span className="text-[11px] font-black text-indigo-600">{task.result.colorNo || '-'}</span>
+                              </div>
+                              <div className="flex items-center gap-1">
+                                <span className="text-[10px] font-black text-stone-400 uppercase">Qty:</span>
+                                <span className="text-[11px] font-black text-emerald-600">{task.result.length} {task.result.unit}</span>
+                              </div>
+                              {task.result.notes && (
+                                <div className="w-full flex items-center gap-1 border-t border-stone-50 pt-1 mt-1">
+                                  <span className="text-[9px] font-black text-amber-500 uppercase">Info:</span>
+                                  <span className="text-[10px] font-bold text-stone-500 truncate">{task.result.notes}</span>
+                                </div>
+                              )}
+                            </div>
+                          )}
                           {task.error ? (
                             <div className="text-[10px] text-red-400 font-medium mt-1 leading-tight">{task.error}</div>
                           ) : (
@@ -855,11 +935,17 @@ export default function App() {
               key="list"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              className="p-4"
+              className="p-4 space-y-4 pb-32"
             >
                 <div className="flex items-center justify-between mb-4 px-2">
                   <h2 className="text-lg font-bold">السجلات والتصدير</h2>
                   <div className="flex gap-2">
+                    <button 
+                      onClick={() => setView('home')}
+                      className="bg-stone-50 text-stone-400 p-3 rounded-2xl active:scale-95 transition-all"
+                    >
+                      <ChevronLeft className="w-5 h-5 rotate-180" />
+                    </button>
                     <button 
                       onClick={() => exportToExcel('SESSION')}
                       className="bg-white border border-stone-100 text-indigo-600 p-3 rounded-2xl shadow-sm hover:bg-indigo-50 transition-all active:scale-95"
@@ -881,24 +967,27 @@ export default function App() {
                     >
                       <FileSpreadsheet className="w-5 h-5" />
                     </button>
-                    <button 
-                      onClick={() => {
-                        if (navigator.share) {
-                          navigator.share({
-                            title: 'تقرير المخزون ORC',
-                            text: `إجمالي الأصناف في المخزون: ${items.length}\nتم التصدير من تطبيق ORC Inventory Pro AI`,
-                            url: window.location.href
-                          }).catch(console.error);
-                        } else {
-                          showToast('المشاركة غير مدعومة في هذا المتصفح', 'error');
-                        }
-                      }}
-                      className="bg-white border border-stone-100 text-blue-600 p-3 rounded-2xl shadow-sm hover:bg-blue-50 transition-all active:scale-95"
-                      title="مشاركة التقرير"
-                    >
-                      <Share2 className="w-5 h-5" />
-                    </button>
                   </div>
+                </div>
+
+                {/* Search Bar in List View */}
+                <div className="relative px-2">
+                  <Search className="absolute right-6 top-1/2 -translate-y-1/2 text-stone-400" size={18} />
+                  <input 
+                    type="text"
+                    placeholder="بحث بالكود أو اللون..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full bg-white border border-stone-100 rounded-2xl px-12 py-4 outline-none font-bold shadow-sm focus:ring-4 focus:ring-indigo-500/5 transition-all"
+                  />
+                  {searchQuery && (
+                    <button 
+                      onClick={() => setSearchQuery('')}
+                      className="absolute left-6 top-1/2 -translate-y-1/2 p-1 bg-stone-50 rounded-full text-stone-400"
+                    >
+                      <X size={14} />
+                    </button>
+                  )}
                 </div>
 
               {/* Search Bar */}
@@ -1158,24 +1247,16 @@ export default function App() {
                 </div>
                 <div className="p-5 border-b border-stone-50 flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 bg-stone-50 rounded-xl flex items-center justify-center text-stone-400"><Trash2 size={18} /></div>
+                    <div className="w-10 h-10 bg-red-50 rounded-xl flex items-center justify-center text-red-400"><Trash2 size={18} /></div>
                     <span className="font-bold text-red-500">مسح كافة السجلات</span>
                   </div>
-                  <button onClick={() => {
-                    setConfirmModal({
-                      show: true,
-                      title: 'مسح البيانات',
-                      message: 'سيتم حذف كافة البيانات نهائياً، هل أنت متأكد؟',
-                      type: 'danger',
-                      onConfirm: async () => {
-                        updateItemsWithHistory([]);
-                        await Preferences.remove({ key: STORAGE_KEY });
-                        localStorage.removeItem(STORAGE_KEY);
-                        setConfirmModal(prev => ({ ...prev, show: false }));
-                      }
-                    });
-                  }} className="text-xs font-bold text-stone-300">مسح</button>
+                  <button onClick={clearAllData} className="text-xs font-bold text-red-600">مسح</button>
                 </div>
+              </div>
+
+              <div className="text-center space-y-2">
+                <p className="text-[10px] font-black text-stone-300 uppercase tracking-[0.3em]">ORC Inventory Pro AI</p>
+                <p className="text-[9px] font-bold text-stone-200 uppercase tracking-widest">Version 2.5.0 • Enterprise Edition</p>
               </div>
 
               <div className="bg-white p-8 rounded-[3rem] shadow-xl shadow-indigo-50 border border-stone-50 relative overflow-hidden group">

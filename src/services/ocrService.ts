@@ -30,21 +30,19 @@ export class OCRService {
            - "itemNo" = The part BEFORE the dot ("ON001127").
            - "colorNo" = The part AFTER the dot ("801").
       
-      2. **TABLE & GRID MAPPING:**
-         - Map headers to values accurately even if the image is tilted.
-         - Arabic Headers Mapping: 
-           - "الماركة" or "ITEM" -> itemNo.
-           - "اللون" or "COLOR" -> colorNo.
-           - "الطول" or "LENGTH" -> length.
-         - If a value is in a cell next to or below a header, that is the correct value.
+      2. **DEEP DETAIL CAPTURE (NO DATA LOSS):**
+         - Scan for technical specifications: "LOT", "BATCH", "WIDTH", "GSM", "G.W", "N.W", "GRADE".
+         - Format these into the "notes" field as a clean string (e.g., "LOT: 123, WIDTH: 280cm, GSM: 180").
+         - If "Made in Egypt" or any origin is found, include it in notes.
 
-      3. **PROMINENT TEXT PRIORITY:**
-         - If no explicit "ITEM NO" label exists, the largest, boldest text at the top or top-left is usually the "itemNo" (e.g., "Alba +", "LAZURDE").
+      3. **TABLE & GRID MAPPING:**
+         - Arabic/English Headers: "الماركة/ITEM", "اللون/COLOR", "الطول/LENGTH", "الوزن/WEIGHT".
+         - Map values accurately based on their position relative to headers.
 
       4. **CLEANING & FORMATTING:**
-         - "colorNo": Remove any "#", "*", or non-alphanumeric symbols. Extract ONLY the code.
-         - "length": Extract ONLY the numeric value (e.g., "52.70"). Remove "M", "MT", or "YARD" from this field.
-         - "unit": If "M", "MT", "MTR" is found, set unit to "M". If "YARD" is found, set to "Yard".
+         - "colorNo": Remove "#", "*", or symbols.
+         - "length": Numeric only. Remove "M", "MT", "YARD".
+         - "unit": Normalize to "M", "Yard", "Roll", or "Piece".
 
       ### FIELDS TO EXTRACT (JSON FORMAT):
       - itemNo: Product code/style.
