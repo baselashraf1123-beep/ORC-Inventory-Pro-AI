@@ -1,3 +1,12 @@
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
+
 export interface InventoryItem {
   id: string;
   code: string; // ITEM NO
@@ -21,5 +30,6 @@ export interface OCRTask {
     length: string;
     unit?: string;
     notes?: string;
+    needsReview?: boolean;
   };
 }

@@ -30,6 +30,7 @@ import {
   Phone,
   ExternalLink,
   Edit2,
+  Edit3,
   ChevronUp,
   ChevronDown,
   Play
@@ -45,6 +46,9 @@ const ocrService = new OCRService();
 
 const STORAGE_KEY = 'orc_inventory_pro_data';
 
+// Final Professional Hardening: Input Sanitization Utility
+const sanitizeInput = (val: string) => (typeof val === 'string' ? val.replace(/[<>]/g, '').trim() : '');
+
 export default function App() {
   const [view, setView] = useState<'home' | 'batch' | 'list' | 'settings' | 'manual'>('home');
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -57,6 +61,7 @@ export default function App() {
   const [editingTask, setEditingTask] = useState<OCRTask | null>(null);
   const [editingSavedItem, setEditingSavedItem] = useState<InventoryItem | null>(null);
   const [zoomedImage, setZoomedImage] = useState<string | null>(null);
+  const [showFullImage, setShowFullImage] = useState<boolean>(false);
   const [confirmModal, setConfirmModal] = useState<{
     show: boolean;
     title: string;
@@ -297,47 +302,88 @@ export default function App() {
     setBatchProgress({ current: 0, total: tasksToProcess.length });
     
     let currentTasks = [...tasks];
-    let processedCount = 0;
+    const BATCH_SIZE = 5; // معالجة 5 صور في الطلب الواحد لتوفير استهلاك الـ API
     
-    for (let i = 0; i < currentTasks.length; i++) {
-      if (currentTasks[i].status !== 'pending' && currentTasks[i].status !== 'failed') continue;
+    // تقسيم المهام إلى مجموعات (Chunks)
+    const taskIndices = currentTasks
+      .map((t, i) => (t.status === 'pending' || t.status === 'failed') ? i : -1)
+      .filter(i => i !== -1);
+
+    for (let i = 0; i < taskIndices.length; i += BATCH_SIZE) {
+      const chunkIndices = taskIndices.slice(i, i + BATCH_SIZE);
       
-      currentTasks[i].status = 'processing';
-      currentTasks[i].error = undefined;
+      // تحديث حالة المجموعة الحالية إلى "قيد المعالجة"
+      chunkIndices.forEach(idx => {
+        currentTasks[idx].status = 'processing';
+        currentTasks[idx].error = undefined;
+      });
       setTasks([...currentTasks]);
 
       try {
-        // ضغط الصورة قبل الإرسال لتحسين الأداء وسرعة الرفع
-        const compressed = await compressImage(currentTasks[i].image);
-        const result = await ocrService.processImage(compressed);
+        // ضغط الصور في المجموعة
+        const compressedImages = await Promise.all(
+          chunkIndices.map(idx => compressImage(currentTasks[idx].image))
+        );
+
+        // إرسال المجموعة بالكامل في طلب واحد
+        const results = await ocrService.processBatch(compressedImages);
         
-        currentTasks[i].result = {
-          itemNo: result.itemNo,
-          colorNo: result.colorNo,
-          length: result.length,
-          unit: result.unit,
-          notes: result.notes
-        };
-        currentTasks[i].status = (result.itemNo && result.length) ? 'success' : 'failed';
-        
-        // Memory Optimization: Clear raw image data after successful processing
-        if (currentTasks[i].status === 'success') {
-          currentTasks[i].image = ''; // Keep memory low on mobile
+        chunkIndices.forEach((idx, resultIdx) => {
+          const result = results[resultIdx];
+          if (result) {
+            currentTasks[idx].result = {
+              itemNo: result.itemNo,
+              colorNo: result.colorNo,
+              length: result.length,
+              unit: result.unit,
+              notes: result.notes,
+              needsReview: result.needsReview
+            };
+            currentTasks[idx].status = (result.itemNo && result.length) ? 'success' : 'failed';
+            
+            if (currentTasks[idx].status === 'success') {
+              currentTasks[idx].image = ''; // توفير الذاكرة فوراً بعد النجاح
+            }
+
+            if (result.needsReview) {
+              currentTasks[idx].error = "تنبيه: البيانات تحتاج لمراجعة يدوية (نمط غير مألوف)";
+            } else if (currentTasks[idx].status === 'failed') {
+              currentTasks[idx].error = "لم يتم العثور على بيانات واضحة في الصورة";
+            }
+          }
+        });
+
+        setTasks([...currentTasks]);
+        setBatchProgress(prev => ({ ...prev, current: prev.current + chunkIndices.length }));
+
+        // تأخير بسيط بين المجموعات لتجنب تجاوز حد الطلبات في الدقيقة
+        if (i + BATCH_SIZE < taskIndices.length) {
+          await new Promise(r => setTimeout(r, 2000));
         }
 
-        if (currentTasks[i].status === 'failed') {
-          currentTasks[i].error = "لم يتم العثور على بيانات واضحة في الصورة";
-        }
       } catch (error: any) {
         console.error("Batch processing error:", error);
-        currentTasks[i].status = 'failed';
-        currentTasks[i].error = error.message || "خطأ في الاتصال بالخادم";
+        
+        // في حالة فشل المجموعة بالكامل، نحددها كفشل
+        chunkIndices.forEach(idx => {
+          currentTasks[idx].status = 'failed';
+          currentTasks[idx].error = error.message;
+        });
+        setTasks([...currentTasks]);
+        
+        if (error.message.includes("quota") || error.message.includes("limit") || error.message.includes("تجاوز حد الاستخدام")) {
+          setConfirmModal({
+            show: true,
+            title: 'تنبيه الاستخدام',
+            message: 'تم الوصول للحد الأقصى للطلبات المجانية حالياً. سيتم استكمال الباقي لاحقاً أو يمكنك المحاولة بعد قليل.',
+            type: 'warning',
+            onConfirm: () => setConfirmModal(prev => ({ ...prev, show: false }))
+          });
+          break; // توقف عن المعالجة إذا كان الخطأ متعلق بالحصص
+        }
       }
-      
-      setTasks([...currentTasks]);
-      processedCount++;
-      setBatchProgress({ current: processedCount, total: tasksToProcess.length });
     }
+    
     setIsProcessing(false);
   };
 
@@ -376,11 +422,11 @@ export default function App() {
 
     const newItem: InventoryItem = {
       id: Math.random().toString(36).substr(2, 9),
-      code: code.toUpperCase(),
-      colorNo: (manualItem.colorNo || '').trim().toUpperCase(),
+      code: sanitizeInput(code).toUpperCase(),
+      colorNo: sanitizeInput(manualItem.colorNo || '').toUpperCase(),
       quantity: quantity,
       unit: manualItem.unit || 'M',
-      notes: (manualItem.notes || '').trim(),
+      notes: sanitizeInput(manualItem.notes || ''),
       sessionId: `MANUAL_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
       createdAt: new Date().toISOString(),
       isExported: false
@@ -411,6 +457,32 @@ export default function App() {
     setManualItem({ code: '', colorNo: '', quantity: 0, unit: 'M', notes: '' });
     showToast('تم حفظ الصنف بنجاح');
     setView('home');
+  };
+
+  const copyToClipboard = (item: InventoryItem) => {
+    const text = `صنف: ${item.code}\nاللون: ${item.colorNo}\nالكمية: ${item.quantity} ${item.unit}\nملاحظات: ${item.notes || '-'}`;
+    navigator.clipboard.writeText(text).then(() => {
+      showToast('تم نسخ البيانات إلى الحافظة');
+    }).catch(err => {
+      console.error('Copy failed:', err);
+      showToast('فشل النسخ', 'error');
+    });
+  };
+
+  const shareItem = async (item: InventoryItem) => {
+    const text = `صنف: ${item.code}\nاللون: ${item.colorNo}\nالكمية: ${item.quantity} ${item.unit}\nملاحظات: ${item.notes || '-'}`;
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'بيانات صنف',
+          text: text
+        });
+      } catch (err) {
+        console.error('Share failed:', err);
+      }
+    } else {
+      copyToClipboard(item);
+    }
   };
 
   const stats = useMemo(() => {
@@ -475,11 +547,11 @@ export default function App() {
         
         const newItems: InventoryItem[] = validTasks.map(t => ({
           id: Math.random().toString(36).substr(2, 9),
-          code: (t.result?.itemNo || '').trim().toUpperCase(),
-          colorNo: (t.result?.colorNo || '').trim().toUpperCase(),
+          code: sanitizeInput(t.result?.itemNo || '').toUpperCase(),
+          colorNo: sanitizeInput(t.result?.colorNo || '').toUpperCase(),
           quantity: parseFloat(t.result?.length || '0') || 0,
           unit: (t.result?.unit || 'M') as 'M' | 'Yard' | 'Roll' | 'Piece',
-          notes: (t.result?.notes || '').trim(),
+          notes: sanitizeInput(t.result?.notes || ''),
           sessionId,
           createdAt: new Date().toISOString(),
           isExported: false
@@ -801,22 +873,45 @@ export default function App() {
             >
               <div className="flex items-center justify-between mb-2 px-2">
                 <h2 className="text-lg font-bold">مراجعة الدفعة ({tasks.length})</h2>
-                {!isProcessing && tasks.some(t => t.status === 'pending' || t.status === 'failed') && (
-                  <button 
-                    onClick={startBatchProcessing}
-                    className="bg-indigo-600 text-white px-5 py-2.5 rounded-2xl text-sm font-bold flex items-center gap-2 shadow-xl shadow-indigo-100 active:scale-95 transition-all"
-                  >
-                    <Play className="w-4 h-4" /> {tasks.some(t => t.status === 'failed') ? 'إعادة محاولة الفاشل' : 'بدء المعالجة'}
-                  </button>
-                )}
-                {!isProcessing && !tasks.some(t => t.status === 'pending') && (
-                  <button 
-                    onClick={saveBatch}
-                    className="bg-emerald-600 text-white px-5 py-2.5 rounded-2xl text-sm font-bold flex items-center gap-2 shadow-xl shadow-emerald-100"
-                  >
-                    <Save className="w-4 h-4" /> اعتماد الجلسة
-                  </button>
-                )}
+                <div className="flex gap-2">
+                  {!isProcessing && tasks.length > 0 && (
+                    <button 
+                      onClick={() => {
+                        setConfirmModal({
+                          show: true,
+                          title: 'مسح القائمة',
+                          message: 'هل تريد مسح جميع الصور الحالية والبدء من جديد؟',
+                          type: 'danger',
+                          onConfirm: () => {
+                            setTasks([]);
+                            setView('home');
+                            setConfirmModal(prev => ({ ...prev, show: false }));
+                          }
+                        });
+                      }}
+                      className="bg-red-50 text-red-600 p-2.5 rounded-2xl active:scale-95 transition-all"
+                      title="مسح الكل"
+                    >
+                      <Trash2 size={20} />
+                    </button>
+                  )}
+                  {!isProcessing && tasks.some(t => t.status === 'pending' || t.status === 'failed') && (
+                    <button 
+                      onClick={startBatchProcessing}
+                      className="bg-indigo-600 text-white px-5 py-2.5 rounded-2xl text-sm font-bold flex items-center gap-2 shadow-xl shadow-indigo-100 active:scale-95 transition-all"
+                    >
+                      <Play className="w-4 h-4" /> {tasks.some(t => t.status === 'failed') ? 'إعادة محاولة الفاشل' : 'بدء المعالجة'}
+                    </button>
+                  )}
+                  {!isProcessing && !tasks.some(t => t.status === 'pending') && tasks.length > 0 && (
+                    <button 
+                      onClick={saveBatch}
+                      className="bg-emerald-600 text-white px-5 py-2.5 rounded-2xl text-sm font-bold flex items-center gap-2 shadow-xl shadow-emerald-100"
+                    >
+                      <Save className="w-4 h-4" /> اعتماد الجلسة
+                    </button>
+                  )}
+                </div>
               </div>
 
               {isProcessing && batchProgress.total > 0 && (
@@ -916,8 +1011,23 @@ export default function App() {
                       )}
                     </div>
                     <div className="flex items-center gap-2">
-                      {task.status === 'success' && <CheckCircle2 className="w-6 h-6 text-emerald-500" />}
-                      {task.status === 'failed' && <AlertCircle className="w-6 h-6 text-red-500" />}
+                      {task.status === 'success' && !task.result?.needsReview && <CheckCircle2 className="w-6 h-6 text-emerald-500" />}
+                      {(task.status === 'failed' || task.result?.needsReview) && (
+                        <div className="flex items-center gap-2">
+                          <button 
+                            onClick={() => setEditingTask(task)}
+                            className={`p-2 rounded-xl transition-colors ${task.result?.needsReview ? 'text-amber-600 bg-amber-50 hover:bg-amber-100' : 'text-indigo-600 bg-indigo-50 hover:bg-indigo-100'}`}
+                            title="تعديل البيانات"
+                          >
+                            <Edit3 className="w-4 h-4" />
+                          </button>
+                          {task.result?.needsReview ? (
+                            <AlertCircle className="w-6 h-6 text-amber-500" />
+                          ) : (
+                            <AlertCircle className="w-6 h-6 text-red-500" />
+                          )}
+                        </div>
+                      )}
                       {task.status === 'pending' && !isProcessing && (
                         <button onClick={() => removeTask(task.id)} className="p-2 text-red-400 hover:text-red-600 bg-red-50 rounded-xl transition-colors">
                           <Trash2 className="w-4 h-4" />
@@ -971,7 +1081,7 @@ export default function App() {
                 </div>
 
                 {/* Search Bar in List View */}
-                <div className="relative px-2">
+                <div className="relative px-2 mb-6">
                   <Search className="absolute right-6 top-1/2 -translate-y-1/2 text-stone-400" size={18} />
                   <input 
                     type="text"
@@ -989,29 +1099,6 @@ export default function App() {
                     </button>
                   )}
                 </div>
-
-              {/* Search Bar */}
-              <div className="px-2 mb-6">
-                <div className="relative">
-                  <input 
-                    type="text"
-                    placeholder="بحث بالكود أو اللون..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    className="w-full bg-white border border-stone-100 rounded-2xl px-12 py-4 shadow-sm outline-none focus:ring-2 ring-indigo-500/20 transition-all font-bold text-sm"
-                  />
-                  <Scan className="absolute right-4 top-1/2 -translate-y-1/2 text-stone-300 w-5 h-5" />
-                  {searchQuery && (
-                    <button 
-                      onClick={() => setSearchQuery('')}
-                      className="absolute left-4 top-1/2 -translate-y-1/2 text-stone-400 hover:text-stone-600 p-2 transition-colors"
-                      title="مسح البحث"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  )}
-                </div>
-              </div>
 
               {filteredItems.length === 0 ? (
                 <div className="text-center py-24 text-stone-300">
@@ -1039,6 +1126,20 @@ export default function App() {
                       </div>
                       <div className="flex items-center gap-2">
                         {item.isExported && <CheckCircle2 className="w-5 h-5 text-emerald-500" />}
+                        <button 
+                          onClick={() => copyToClipboard(item)}
+                          className="text-stone-300 hover:text-indigo-600 p-2 transition-colors"
+                          title="نسخ"
+                        >
+                          <Save className="w-5 h-5" />
+                        </button>
+                        <button 
+                          onClick={() => shareItem(item)}
+                          className="text-stone-300 hover:text-indigo-600 p-2 transition-colors"
+                          title="مشاركة"
+                        >
+                          <Share2 className="w-5 h-5" />
+                        </button>
                         <button 
                           onClick={() => setEditingSavedItem(item)}
                           className="text-stone-300 hover:text-indigo-600 p-2 transition-colors"
@@ -1254,7 +1355,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="text-center space-y-2">
+              <div className="text-center space-y-2 pt-12">
                 <p className="text-[10px] font-black text-stone-300 uppercase tracking-[0.3em]">ORC Inventory Pro AI</p>
                 <p className="text-[9px] font-bold text-stone-200 uppercase tracking-widest">Version 2.5.0 • Enterprise Edition</p>
               </div>
@@ -1286,7 +1387,37 @@ export default function App() {
         </AnimatePresence>
       </main>
 
-      {/* Quick Edit Modal */}
+      {/* Full Screen Image Zoom Modal */}
+      <AnimatePresence>
+        {showFullImage && zoomedImage && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] bg-black/95 flex flex-col items-center justify-center p-4"
+          >
+            <button 
+              onClick={() => setShowFullImage(false)}
+              className="absolute top-6 right-6 p-3 bg-white/10 hover:bg-white/20 rounded-full text-white transition-all z-[110]"
+            >
+              <X size={24} />
+            </button>
+            <div className="w-full h-full flex items-center justify-center">
+              <motion.img 
+                initial={{ scale: 0.8 }}
+                animate={{ scale: 1 }}
+                src={zoomedImage} 
+                alt="Full View" 
+                className="max-w-full max-h-full object-contain shadow-2xl"
+                referrerPolicy="no-referrer"
+              />
+            </div>
+            <div className="absolute bottom-10 text-white/50 text-xs font-bold uppercase tracking-widest">
+              انقر على الإغلاق للعودة
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       {editingTask && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-indigo-950/80 backdrop-blur-md">
           <motion.div 
@@ -1304,7 +1435,10 @@ export default function App() {
                    <img 
                     src={editingTask.image} 
                     alt="Zoom" 
-                    onClick={() => setZoomedImage(editingTask.image)}
+                    onClick={() => {
+                      setZoomedImage(editingTask.image);
+                      setShowFullImage(true);
+                    }}
                     className="w-full h-full object-contain transition-transform duration-300 hover:scale-150 cursor-zoom-in" 
                     referrerPolicy="no-referrer" 
                   />
@@ -1457,7 +1591,14 @@ export default function App() {
 
                   const updatedTasks = tasks.map(t => t.id === editingTask.id ? { 
                     ...editingTask, 
-                    result: { ...editingTask.result!, itemNo: code.toUpperCase(), length: String(quantity) },
+                    result: { 
+                      ...editingTask.result!, 
+                      itemNo: sanitizeInput(code).toUpperCase(), 
+                      colorNo: sanitizeInput(editingTask.result?.colorNo || '').toUpperCase(),
+                      length: String(quantity),
+                      notes: sanitizeInput(editingTask.result?.notes || ''),
+                      needsReview: false
+                    },
                     status: 'success' as const,
                     error: undefined 
                   } : t);
@@ -1603,9 +1744,10 @@ export default function App() {
 
                   const updatedItems = items.map(i => i.id === editingSavedItem.id ? {
                     ...editingSavedItem,
-                    code: code.toUpperCase(),
-                    colorNo: (editingSavedItem.colorNo || '').trim().toUpperCase(),
-                    quantity: quantity
+                    code: sanitizeInput(code).toUpperCase(),
+                    colorNo: sanitizeInput(editingSavedItem.colorNo || '').toUpperCase(),
+                    quantity: quantity,
+                    notes: sanitizeInput(editingSavedItem.notes || '')
                   } : i);
                   updateItemsWithHistory(updatedItems);
                   setEditingSavedItem(null);
