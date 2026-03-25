@@ -31,6 +31,7 @@ import {
   ExternalLink,
   Edit2,
   Edit3,
+  RotateCcw,
   ChevronUp,
   ChevronDown,
   Play
@@ -289,6 +290,46 @@ export default function App() {
     });
   };
 
+  const retryTask = async (idx: number) => {
+    const task = tasks[idx];
+    if (!task || isProcessing) return;
+
+    setTasks(prev => {
+      const newTasks = [...prev];
+      newTasks[idx] = { ...newTasks[idx], status: 'processing', error: undefined };
+      return newTasks;
+    });
+
+    try {
+      const compressed = await compressImage(task.image);
+      const result = await ocrService.processImage(compressed);
+      
+      setTasks(prev => {
+        const newTasks = [...prev];
+        // More flexible success condition
+        const hasSomeData = result.itemNo || result.colorNo || result.length;
+        newTasks[idx] = {
+          ...newTasks[idx],
+          status: hasSomeData ? 'success' : 'failed',
+          result,
+          error: result.needsReview ? "تنبيه: البيانات تحتاج لمراجعة يدوية (نمط غير مألوف)" : 
+                 (!hasSomeData ? "لم يتم العثور على بيانات واضحة في الصورة" : undefined)
+        };
+        // Clear image data after successful processing to save memory
+        if (newTasks[idx].status === 'success') {
+          newTasks[idx].image = '';
+        }
+        return newTasks;
+      });
+    } catch (error: any) {
+      setTasks(prev => {
+        const newTasks = [...prev];
+        newTasks[idx] = { ...newTasks[idx], status: 'failed', error: error.message };
+        return newTasks;
+      });
+    }
+  };
+
   const startBatchProcessing = async () => {
     if (isProcessing) return;
     setIsProcessing(true);
@@ -339,7 +380,9 @@ export default function App() {
               notes: result.notes,
               needsReview: result.needsReview
             };
-            currentTasks[idx].status = (result.itemNo && result.length) ? 'success' : 'failed';
+            // More flexible success condition: if any key data is found, it's a success but might need review
+            const hasSomeData = result.itemNo || result.colorNo || result.length;
+            currentTasks[idx].status = hasSomeData ? 'success' : 'failed';
             
             if (currentTasks[idx].status === 'success') {
               currentTasks[idx].image = ''; // توفير الذاكرة فوراً بعد النجاح
@@ -1012,6 +1055,15 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-2">
                       {task.status === 'success' && !task.result?.needsReview && <CheckCircle2 className="w-6 h-6 text-emerald-500" />}
+                      {task.status === 'failed' && task.image && (
+                        <button 
+                          onClick={() => retryTask(index)}
+                          className="p-2 bg-indigo-50 text-indigo-600 rounded-xl hover:bg-indigo-100 transition-colors"
+                          title="إعادة المحاولة"
+                        >
+                          <RotateCcw size={16} />
+                        </button>
+                      )}
                       {(task.status === 'failed' || task.result?.needsReview) && (
                         <div className="flex items-center gap-2">
                           <button 

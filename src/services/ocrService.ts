@@ -120,9 +120,9 @@ export class OCRService {
       let needsReview = false;
       let confidence: "high" | "low" = "high";
 
-      // Check for common patterns
-      const itemPattern = /^[A-Z]{1,4}\d+/; // Starts with letters then numbers
-      const colorPattern = /^\d{2,6}$/; // 2-6 digits
+      // Check for common patterns (Loosened for better reliability)
+      const itemPattern = /^[A-Z0-9.-]{2,15}$/; // More flexible: letters, numbers, dots, dashes
+      const colorPattern = /^[A-Z0-9.-]{1,10}$/; // Colors can be anything alphanumeric
 
       if (!itemPattern.test(itemNo) && itemNo !== "") {
         needsReview = true;
@@ -191,14 +191,15 @@ export class OCRService {
 
     const model = "gemini-3-flash-preview";
     const batchPrompt = `
-      You are a professional inventory auditor. Analyze the provided ${images.length} images of inventory labels.
-      Extract data for EACH image accurately.
+      You are a professional inventory auditor expert in OCR. Analyze the provided ${images.length} images of inventory labels.
+      Extract data for EACH image with 100% accuracy.
 
-      ### EXTRACTION RULES FOR EACH IMAGE:
-      1. **THE DOT SPLITTER:** Split "XXXX.YYY" into itemNo (XXXX) and colorNo (YYY).
-      2. **DEEP DETAIL:** Capture LOT, BATCH, WIDTH, GSM, GRADE into "notes".
-      3. **CLEANING:** length must be numeric. unit must be M, Yard, Roll, or Piece.
-      
+      ### EXTRACTION RULES (APPLY TO EACH IMAGE):
+      1. **THE DOT SPLITTER:** If a code is "XXXX.YYY", split into itemNo (XXXX) and colorNo (YYY).
+      2. **DEEP DETAIL:** Capture LOT, BATCH, WIDTH, GSM, G.W, N.W, GRADE into "notes".
+      3. **MAPPING:** Scan for headers like "ITEM", "COLOR", "LENGTH", "WEIGHT" in both Arabic and English.
+      4. **CLEANING:** "length" must be numeric only. "unit" must be M, Yard, Roll, or Piece.
+
       ### OUTPUT FORMAT:
       Return a JSON ARRAY of objects. Each object corresponds to an image in the order provided.
       [
@@ -206,7 +207,7 @@ export class OCRService {
         ...
       ]
       
-      If an image is unreadable, return empty strings for its fields.
+      If a field is not found, return an empty string "".
     `;
 
     try {
