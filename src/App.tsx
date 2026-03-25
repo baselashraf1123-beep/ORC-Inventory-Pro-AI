@@ -1178,20 +1178,7 @@ export default function App() {
                     </button>
                     {items.length > 0 && (
                       <button 
-                        onClick={() => {
-                          setConfirmModal({
-                            show: true,
-                            title: 'حذف جميع السجلات',
-                            message: 'هل أنت متأكد من رغبتك في حذف جميع السجلات المحفوظة نهائياً؟ لا يمكن التراجع عن هذا الإجراء.',
-                            type: 'danger',
-                            onConfirm: async () => {
-                              setItems([]);
-                              await Preferences.remove({ key: STORAGE_KEY });
-                              setConfirmModal(prev => ({ ...prev, show: false }));
-                              showToast("تم حذف جميع السجلات بنجاح", "success");
-                            }
-                          });
-                        }}
+                        onClick={clearAllData}
                         className="bg-red-50 text-red-600 p-3 rounded-2xl active:scale-95 transition-all"
                         title="حذف الكل"
                       >
