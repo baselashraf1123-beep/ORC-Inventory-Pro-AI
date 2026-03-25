@@ -46,6 +46,7 @@ import { InventoryItem, OCRTask } from './types';
 const ocrService = new OCRService();
 
 const STORAGE_KEY = 'orc_inventory_pro_data';
+const TASKS_STORAGE_KEY = 'orc_inventory_pro_tasks';
 
 // Final Professional Hardening: Input Sanitization Utility
 const sanitizeInput = (val: string) => (typeof val === 'string' ? val.replace(/[<>]/g, '').trim() : '');
@@ -94,22 +95,40 @@ export default function App() {
   // Load data and handle migration
   useEffect(() => {
     const loadData = async () => {
-      // 1. Check Preferences first
-      const { value } = await Preferences.get({ key: STORAGE_KEY });
-      
-      if (value) {
-        setItems(JSON.parse(value));
-      } else {
-        // 2. Fallback to localStorage for migration
-        const legacyData = localStorage.getItem(STORAGE_KEY);
-        if (legacyData) {
-          const parsed = JSON.parse(legacyData);
-          setItems(parsed);
-          // Save to Preferences immediately
-          await Preferences.set({ key: STORAGE_KEY, value: legacyData });
-          // Optional: clear localStorage after successful migration
-          // localStorage.removeItem(STORAGE_KEY);
+      try {
+        // 1. Check Preferences first
+        const { value } = await Preferences.get({ key: STORAGE_KEY });
+        const { value: storedTasks } = await Preferences.get({ key: TASKS_STORAGE_KEY });
+        
+        if (value) {
+          const parsed = JSON.parse(value);
+          // Data Integrity Check: Ensure every item has required fields
+          const validItems = Array.isArray(parsed) ? parsed.filter(i => i.id && i.code && i.quantity !== undefined) : [];
+          setItems(validItems);
+        } else {
+          // 2. Fallback to localStorage for migration
+          const legacyData = localStorage.getItem(STORAGE_KEY);
+          if (legacyData) {
+            const parsed = JSON.parse(legacyData);
+            const validItems = Array.isArray(parsed) ? parsed.filter(i => i.id && i.code && i.quantity !== undefined) : [];
+            setItems(validItems);
+            // Save to Preferences immediately
+            await Preferences.set({ key: STORAGE_KEY, value: JSON.stringify(validItems) });
+          }
         }
+
+        if (storedTasks) {
+          const parsedTasks = JSON.parse(storedTasks);
+          // Only restore tasks that have images
+          const validTasks = Array.isArray(parsedTasks) ? parsedTasks.filter(t => t.image || t.status === 'success') : [];
+          if (validTasks.length > 0) {
+            setTasks(validTasks);
+            setView('batch');
+          }
+        }
+      } catch (err) {
+        console.error("Critical Data Load Error:", err);
+        showToast("خطأ في تحميل البيانات المحفوظة", "error");
       }
       setIsDataLoaded(true);
     };
@@ -122,10 +141,11 @@ export default function App() {
     
     const timer = setTimeout(() => {
       Preferences.set({ key: STORAGE_KEY, value: JSON.stringify(items) });
-    }, 1000); // Wait 1 second after last change before saving
+      Preferences.set({ key: TASKS_STORAGE_KEY, value: JSON.stringify(tasks) });
+    }, 1000);
 
     return () => clearTimeout(timer);
-  }, [items, isDataLoaded]);
+  }, [items, tasks, isDataLoaded]);
 
   // Security & IP Protection Measures
   useEffect(() => {
@@ -329,6 +349,17 @@ export default function App() {
       });
     }
   };
+
+  const [batchSearchQuery, setBatchSearchQuery] = useState('');
+
+  const filteredTasks = useMemo(() => {
+    if (!batchSearchQuery) return tasks;
+    return tasks.filter(t => 
+      t.result?.itemNo?.toLowerCase().includes(batchSearchQuery.toLowerCase()) ||
+      t.result?.colorNo?.toLowerCase().includes(batchSearchQuery.toLowerCase()) ||
+      t.error?.toLowerCase().includes(batchSearchQuery.toLowerCase())
+    );
+  }, [tasks, batchSearchQuery]);
 
   const startBatchProcessing = async () => {
     if (isProcessing) return;
@@ -957,6 +988,22 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Batch Search */}
+              {tasks.length > 5 && (
+                <div className="px-2">
+                  <div className="relative">
+                    <Search className="absolute right-3 top-1/2 -translate-y-1/2 text-stone-400 w-4 h-4" />
+                    <input 
+                      type="text"
+                      placeholder="بحث في نتائج الدفعة..."
+                      value={batchSearchQuery}
+                      onChange={(e) => setBatchSearchQuery(e.target.value)}
+                      className="w-full bg-white border border-stone-100 rounded-2xl py-2.5 pr-10 pl-4 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                    />
+                  </div>
+                </div>
+              )}
+
               {isProcessing && batchProgress.total > 0 && (
                 <div className="mb-4 px-2">
                   <div className="flex justify-between text-xs font-bold text-stone-500 mb-2">
@@ -974,7 +1021,7 @@ export default function App() {
               )}
 
               <div className="space-y-3">
-                {tasks.map((task, index) => (
+                {filteredTasks.map((task, index) => (
                   <div 
                     key={task.id}
                     className={`bg-white p-4 rounded-3xl border-2 transition-all flex items-center gap-4 ${
@@ -1129,6 +1176,28 @@ export default function App() {
                     >
                       <FileSpreadsheet className="w-5 h-5" />
                     </button>
+                    {items.length > 0 && (
+                      <button 
+                        onClick={() => {
+                          setConfirmModal({
+                            show: true,
+                            title: 'حذف جميع السجلات',
+                            message: 'هل أنت متأكد من رغبتك في حذف جميع السجلات المحفوظة نهائياً؟ لا يمكن التراجع عن هذا الإجراء.',
+                            type: 'danger',
+                            onConfirm: async () => {
+                              setItems([]);
+                              await Preferences.remove({ key: STORAGE_KEY });
+                              setConfirmModal(prev => ({ ...prev, show: false }));
+                              showToast("تم حذف جميع السجلات بنجاح", "success");
+                            }
+                          });
+                        }}
+                        className="bg-red-50 text-red-600 p-3 rounded-2xl active:scale-95 transition-all"
+                        title="حذف الكل"
+                      >
+                        <Trash2 className="w-5 h-5" />
+                      </button>
+                    )}
                   </div>
                 </div>
 

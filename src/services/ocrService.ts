@@ -38,13 +38,15 @@ export class OCRService {
          - If "Made in Egypt" or any origin is found, include it in notes.
 
       3. **TABLE & GRID MAPPING:**
-         - Arabic/English Headers: "الماركة/ITEM", "اللون/COLOR", "الطول/LENGTH", "الوزن/WEIGHT".
+         - Arabic/English Headers: "الماركة/ITEM", "اللون/COLOR", "الطول/LENGTH", "الوزن/WEIGHT", "الكمية/QTY".
          - Map values accurately based on their position relative to headers.
+         - If you see "M" or "م" after a number, it's the length.
+         - If you see "Y" or "ياردة" after a number, it's the length in yards.
 
       4. **CLEANING & FORMATTING:**
-         - "colorNo": Remove "#", "*", or symbols.
-         - "length": Numeric only. Remove "M", "MT", "YARD".
-         - "unit": Normalize to "M", "Yard", "Roll", or "Piece".
+         - "colorNo": Remove "#", "*", or symbols. If it's a word like "Navy" or "Black", keep it.
+         - "length": Numeric only. Remove "M", "MT", "YARD", "م", "ياردة".
+         - "unit": Normalize to "M", "Yard", "Roll", or "Piece". Default to "M" if not sure.
 
       ### PATTERN RECOGNITION (CROSS-REFERENCE):
       - "itemNo" usually starts with letters followed by numbers (e.g., ON, AB, XY).
@@ -111,11 +113,16 @@ export class OCRService {
       // Pattern Cross-Referencing & Validation Logic
       let itemNo = String(result.itemNo || "").trim().toUpperCase();
       let colorNo = String(result.colorNo || "").trim().toUpperCase();
-      const length = String(result.length || "").trim();
+      let length = String(result.length || "").trim();
       
       // Post-processing: Standardize common OCR mistakes
       itemNo = itemNo.replace(/[^A-Z0-9.-]/g, ""); // Remove invalid chars
-      colorNo = colorNo.replace(/[^0-9A-Z]/g, ""); // Color is usually alphanumeric
+      colorNo = colorNo.replace(/[^0-9A-Z\s-]/g, ""); // Color can be alphanumeric or name
+      
+      // Fix common number misreadings (e.g. 'O' instead of '0' in numeric fields)
+      if (length.includes('O')) length = length.replace(/O/g, '0');
+      if (length.includes('I')) length = length.replace(/I/g, '1');
+      length = length.replace(/[^0-9.]/g, ""); // Keep only numbers and dots
 
       let needsReview = false;
       let confidence: "high" | "low" = "high";
